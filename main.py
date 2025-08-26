@@ -1,14 +1,26 @@
 import os
-
 from flask import Flask
+from entities.platerecognizer.infer import infer_bp
+from entities.streaming.streaming import stream_bp
 
 app = Flask(__name__)
+app.register_blueprint(infer_bp)
+app.register_blueprint(stream_bp)
 
-@app.route("/")
-def hello_world():
-  """Example Hello World route."""
-  name = os.environ.get("NAME", "World")
-  return f"Hello {name}!"
+from flask import send_from_directory
+
+@app.route('/')
+def index():
+    return '''
+        <h1>Monitoramento de Placas 🚗</h1>
+        <img src="/video_feed" width="800">
+    '''
 
 if __name__ == "__main__":
-  app.run(debug=True, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+    while True:
+        try:
+            app.run(debug=True, use_reloader=False, host="0.0.0.0", port=3000)
+        except Exception:
+            traceback.print_exc()
+            print("Aplicação travou! Reiniciando em 5 segundos...")
+            time.sleep(5)
