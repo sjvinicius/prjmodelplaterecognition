@@ -6,11 +6,12 @@ import cv2
 import easyocr
 from ultralytics import YOLO
 import os
+import time
 
 stream_bp = Blueprint('stream_bp', __name__)
 
 # Configurações
-MIN_PLATE_AREA = 3000  # Ajuste conforme necessário
+MIN_PLATE_AREA = 30000  # Tamanho da area de captura
 CONSECUTIVE_THRESHOLD = 3  # Leituras consecutivas necessárias
 INFER_URL = "https://5000-firebase-prjplaterecog-1755611185279.cluster-j6d3cbsvdbe5uxnhqrfzzeyj7i.cloudworkstations.dev/infer"  # endpoint da API infer
 
@@ -34,9 +35,14 @@ CAMERA_SOURCE = os.path.join(
 FRAME_SKIP = 20
 last_plate_detected = None
 last_plate_sent = None
+last_status_txt = None
+last_status_color = (0, 0, 255)
+last_status_time = 0
+DISPLAY_DURATION = 3  # segundos que vai ficar na tela
 
 def gen_frames(CAMERA_SOURCE):
     global last_plate_detected, last_plate_sent, consecutive_count
+    global last_status_txt, last_status_color, last_status_time
 
     cap = cv2.VideoCapture(CAMERA_SOURCE)
     if not cap.isOpened():
@@ -47,7 +53,9 @@ def gen_frames(CAMERA_SOURCE):
     while True:
         success, frame = cap.read()
         if not success:
-            break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            continue 
+        
 
         if skip_counter < FRAME_SKIP:
             skip_counter += 1
@@ -62,8 +70,10 @@ def gen_frames(CAMERA_SOURCE):
             for box in r.boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
                 bbox_area = (x2 - x1) * (y2 - y1)
-                if bbox_area < MIN_PLATE_AREA:
-                    continue
+                # if bbox_area < MIN_PLATE_AREA:
+                #     continue
+    
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
                 plate_crop = pil_img.crop((x1, y1, x2, y2))
                 buf = io.BytesIO()
@@ -83,25 +93,21 @@ def gen_frames(CAMERA_SOURCE):
                         last_plate_detected = plate_text
                         consecutive_count = 1
 
-                    # só envia se for diferente da última enviada
                     if consecutive_count >= CONSECUTIVE_THRESHOLD and plate_text != last_plate_sent:
-                        try:
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            if plate_text:
-                                cv2.putText(frame, plate_text, (x1, y1 - 10),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                        status_txt = f"Placa {plate_text}: HABILITADA"
+                        color = (0, 255, 0)
 
-                            buf = io.BytesIO()
-                            pil_img.save(buf, format="JPEG")
-                            files = {"image": ("frame.jpg", buf.getvalue(), "image/jpeg")}
-                            response = requests.post(INFER_URL, files=files, timeout=30)
-                            if response.status_code == 200:
-                                last_plate_sent = plate_text  # marca como enviada com sucesso
-                                
-                            print(response.json())
-                        except Exception as e:
-                            print("Erro ao enviar para /infer:", e)
-                        consecutive_count = 0                
+                        last_status_txt = status_txt
+                        last_status_color = color
+                        last_status_time = time.time()  # marca o momento
+                        
+                        # last_plate_sent = plate_text
+                        consecutive_count = 0
+
+        # desenha o último status se ainda não expirou
+        if last_status_txt and (time.time() - last_status_time) < DISPLAY_DURATION:
+            cv2.putText(frame, last_status_txt, (50, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, last_status_color, 2)
 
         ret, buffer = cv2.imencode('.jpg', frame)
         frame_bytes = buffer.tobytes()

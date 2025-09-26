@@ -1,21 +1,35 @@
 { pkgs, ... }: {
   channel = "stable-24.05";
+
   packages = [
     pkgs.python3
-    pkgs.apt
-    pkgs.mesa # bibliotecas mesa básicas
-    pkgs.mesa.dev # arquivos de desenvolvimento (inclui libGL.so)
-    pkgs.libGL # garante libGL.so.1 disponível
+    pkgs.glib              # fornece libgthread-2.0.so.0
+    pkgs.libGL
+    pkgs.libGLU
+    pkgs.mesa
+    pkgs.mesa.dev
+
+    pkgs.xorg.libSM
+    pkgs.xorg.libXrender
+    pkgs.xorg.libXext
   ];
+
   idx = {
-    extensions = [ "ms-python.python" "rangav.vscode-thunder-client" ];
+    extensions = [
+      "ms-python.python"
+      "rangav.vscode-thunder-client"
+    ];
+
     workspace = {
       onCreate = {
         install =
           "python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt";
         default.openFiles = [ "README.md" "src/index.html" "main.py" ];
       };
-      onStart = { run-server = "./devserver.sh"; };
+
+      onStart = {
+        run-server = "./devserver.sh";
+      };
     };
   };
 }
