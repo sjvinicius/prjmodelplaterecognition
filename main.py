@@ -1,16 +1,21 @@
 import os
+import time
+import traceback
 from flask import Flask
 from entities.platerecognizer.infer import infer_bp
-from entities.streaming.streaming import stream_bp
+from entities.streaming.streaming import stream_bp, authenticate
 
 app = Flask(__name__)
 app.register_blueprint(infer_bp)
 app.register_blueprint(stream_bp)
 
-from flask import send_from_directory
+# @app.before_first_request
+# def init_auth():
+#     authenticate()
 
 @app.route('/')
 def index():
+    authenticate()
     return '''
         <h1>Monitoramento de Placas 🚗</h1>
         <img src="/video_feed" width="800">
