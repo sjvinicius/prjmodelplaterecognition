@@ -24,16 +24,7 @@ cipher = Fernet(SECRET_KEY)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 DEBUG_CAMERA = os.getenv("DEBUG_CAMERA", "true").lower() == "true"
-DEBUG_CAMERA = False
-RTSP_URL = os.getenv("RTSP_URL", "rtsp://170.93.143.139/rtplive/470011e600ef003a004ee33696235daa")
-LOCAL_VIDEO = os.getenv("LOCAL_VIDEO", "resources/video480p.mp4")
-
-if DEBUG_CAMERA:
-    CAMERA_SOURCE = os.path.join(BASE_DIR, LOCAL_VIDEO)
-    print("[CAMERA] DEBUG: vídeo local")
-else:
-    CAMERA_SOURCE = RTSP_URL
-    print("[CAMERA] PRODUÇÃO: RTSP")
+CAMERA_SOURCE_ENV = os.getenv("CAMERA_SOURCE", "resources/video480p.mp4")
 
 EVENTS_DIR = os.path.join(BASE_DIR, "events")
 os.makedirs(EVENTS_DIR, exist_ok=True)
@@ -55,98 +46,7 @@ PLATE_MODEL = YOLO("models/LP-detection.pt")
 # ESTADO
 # =========================
 ACTIVE_PLATES = {}
-
-# =========================
-# CLASSE DE CÂMERA
-# =========================
-class RTSPCamera:
-    def __init__(self, url, buffer_size=30, reconnect_delay=2, is_local=False, width=640, height=360):
-        self.url = url
-        self.buffer = deque(maxlen=buffer_size)
-        self.lock = threading.Lock()
-        self.running = True
-        self.last_frame_time = 0
-        self.reconnect_delay = reconnect_delay
-        self.is_local = is_local
-        self.width = width
-        self.height = height
-        self.proc = None
-        self.cap = None
-        self.frame_interval = 0.033
-
-        threading.Thread(target=self._reader, daemon=True).start()
-
-    def connect(self):
-        # Fecha processo anterior
-        if self.proc:
-            self.proc.kill()
-            self.proc = None
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-        if self.is_local:
-            self.cap = cv2.VideoCapture(self.url)
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.frame_interval = 1 / fps if fps > 0 else 0.033
-        else:
-            # RTSP via FFmpeg
-            cmd = [
-                "ffmpeg",
-                "-rtsp_transport", "tcp",
-                "-i", self.url,
-                "-f", "rawvideo",
-                "-pix_fmt", "bgr24",
-                "-"
-            ]
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10**8)
-
-    def _reader(self):
-        self.connect()
-        while self.running:
-            try:
-                if self.is_local:
-                    if not self.cap.isOpened():
-                        time.sleep(self.reconnect_delay)
-                        self.connect()
-                        continue
-                    ret, frame = self.cap.read()
-                    if not ret:
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        continue
-                else:
-                    raw_frame = self.proc.stdout.read(self.width * self.height * 3)
-                    if len(raw_frame) != self.width * self.height * 3:
-                        self.connect()
-                        time.sleep(self.reconnect_delay)
-                        continue
-                    frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
-            except Exception as e:
-                print("[CAMERA] Erro:", e)
-                self.connect()
-                time.sleep(self.reconnect_delay)
-                continue
-
-            with self.lock:
-                self.buffer.append(frame)
-                self.last_frame_time = time.time()
-
-            if self.is_local:
-                time.sleep(self.frame_interval)
-
-    def read(self):
-        with self.lock:
-            if self.buffer:
-                return True, self.buffer.popleft()
-            return False, None
-
-    def watchdog(self, timeout=5):
-        if time.time() - self.last_frame_time > timeout:
-            print("[WATCHDOG] Reiniciando stream2...")
-            self.connect()
-
-
-camera = RTSPCamera(CAMERA_SOURCE, is_local=DEBUG_CAMERA, width=640, height=360)
+_camera_instance = None  # singleton da câmera
 
 # =========================
 # FUNÇÃO IOU
@@ -183,13 +83,166 @@ def save_event(frame, bbox):
     print(f"[EVENT] {event_id}")
 
 # =========================
+# CLASSE DE CÂMERA
+# =========================
+# =========================
+# CLASSE DE CÂMERA AJUSTADA
+# =========================
+class CameraSource:
+    def __init__(self, source, buffer_size=30, reconnect_delay=2, width=640, height=360):
+        self.source = source
+        self.buffer = deque(maxlen=buffer_size)
+        self.lock = threading.Lock()
+        self.running = True
+        self.last_frame_time = 0
+        self.reconnect_delay = reconnect_delay
+        self.width = width
+        self.height = height
+        self.proc = None
+        self.cap = None
+        self.frame_interval = 0.033
+
+        self.is_local_file = os.path.isfile(source)
+        self.is_webcam = isinstance(source, int)
+        self.is_rtsp = isinstance(source, str) and source.startswith("rtsp://")
+
+        # inicia a thread que vai ler os frames
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def connect(self):
+        if self.proc:
+            self.proc.kill()
+            self.proc = None
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+            time.sleep(1.0)  # garante liberação do dispositivo
+
+        if self.is_local_file or self.is_webcam:
+            max_wait = 10  # segundos para esperar a câmera
+            start_time = time.time()
+            ret = False
+            first_frame = None
+
+            while time.time() - start_time < max_wait:
+                try:
+                    if self.cap is None or not self.cap.isOpened():
+                        self.cap = cv2.VideoCapture(self.source)
+                        if not self.cap.isOpened():
+                            raise Exception("Device busy")
+
+                    ret, frame = self.cap.read()
+                    if ret:
+                        first_frame = frame
+                        break  # câmera pronta
+
+                except Exception as e:
+                    print(f"[CAMERA] Não foi possível abrir a câmera: {e}")
+
+                time.sleep(0.5)  # espera antes de tentar de novo
+
+            if not ret:
+                print(f"[CAMERA] Webcam ou vídeo não retornou frames após {max_wait}s: {self.source}")
+                if self.cap:
+                    self.cap.release()
+                    self.cap = None
+                self.last_frame_time = 0
+                return
+
+            # Coloca o primeiro frame no buffer
+            with self.lock:
+                self.buffer.append(first_frame)
+                self.last_frame_time = time.time()
+
+            fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.frame_interval = 1 / fps if fps > 0 else 0.033
+            print(f"[CAMERA] Conectado a {'arquivo' if self.is_local_file else 'webcam'}: {self.source}")
+
+    def _reader(self):
+        self.connect()
+        while self.running:
+            try:
+                if self.is_local_file or self.is_webcam:
+                    if not self.cap or not self.cap.isOpened():
+                        time.sleep(self.reconnect_delay)
+                        self.connect()
+                        continue
+
+                    ret, frame = self.cap.read()
+                    if not ret:
+                        if self.is_local_file:
+                            # reinicia vídeo do início
+                            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            continue
+                        else:
+                            # webcam travada, tenta reconectar
+                            self.connect()
+                            continue
+
+                else:  # RTSP ou ffmpeg proc
+                    if not self.proc:
+                        time.sleep(self.reconnect_delay)
+                        self.connect()
+                        continue
+                    raw_frame = self.proc.stdout.read(self.width * self.height * 3)
+                    if len(raw_frame) != self.width * self.height * 3:
+                        self.connect()
+                        time.sleep(self.reconnect_delay)
+                        continue
+                    frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
+
+            except Exception as e:
+                print("[CAMERA] Erro:", e)
+                self.connect()
+                time.sleep(self.reconnect_delay)
+                continue
+
+            with self.lock:
+                self.buffer.append(frame)
+                self.last_frame_time = time.time()
+
+            if self.is_local_file or self.is_webcam:
+                time.sleep(self.frame_interval)
+
+    def read(self):
+        with self.lock:
+            if self.buffer:
+                return True, self.buffer.popleft()
+            return False, None
+
+    def watchdog(self, timeout=5):
+        # só reinicia se for webcam ou RTSP
+        if (self.is_webcam or self.is_rtsp):
+            if (time.time() - self.last_frame_time > timeout) and ((self.cap and self.cap.isOpened()) or self.proc):
+                print("[WATCHDOG] Reiniciando câmera...")
+                self.connect()
+
+
+# =========================
+# FUNÇÃO GET CAMERA (SINGLETON)
+# =========================
+def get_camera():
+    global _camera_instance
+    if _camera_instance is None:
+        print(CAMERA_SOURCE_ENV)
+        print("teste")
+        print(CAMERA_SOURCE_ENV)
+        if CAMERA_SOURCE_ENV.isdigit():
+            source = int(CAMERA_SOURCE_ENV)
+        else:
+            source = CAMERA_SOURCE_ENV
+        _camera_instance = CameraSource(source, width=640, height=360)
+    return _camera_instance
+
+# =========================
 # LOOP DE STREAM
 # =========================
-def gen_frames():
+def gen_frames(camera):
     skip = 0
     fps_count = 0
     fps_time = time.time()
     fps = 0
+
     while True:
         camera.watchdog()
         ok, frame = camera.read()
@@ -230,7 +283,6 @@ def gen_frames():
             if roi.size == 0:
                 continue
 
-            # Detecta placa
             pres = PLATE_MODEL(roi, conf=0.3, imgsz=320, verbose=False)[0]
             for pb in pres.boxes:
                 px1, py1, px2, py2 = map(int, pb.xyxy[0])
@@ -264,7 +316,6 @@ def gen_frames():
                 if SHOW_BORDER_IDENTIFICATION:
                     cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
 
-        # Exibe FPS
         cv2.putText(frame, f"FPS: {fps}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
@@ -272,16 +323,19 @@ def gen_frames():
         yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
 
 # =========================
-# ROTAS
+# ROTAS FLASK
 # =========================
 @stream_bp.route("/video_feed")
 def video_feed():
-    return Response(gen_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    camera = get_camera()
+
+    return Response(gen_frames(camera), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @stream_bp.route("/health")
 def health():
+    camera = get_camera()
     now = time.time()
-    camera_ok = camera.cap is not None and camera.cap.isOpened()
+    camera_ok = (camera.cap is not None and camera.cap.isOpened()) or camera.proc is not None
     frame_ok = now - camera.last_frame_time < 5
     queue_size = len(os.listdir(EVENTS_DIR))
     disk_ok = os.access(EVENTS_DIR, os.W_OK)
