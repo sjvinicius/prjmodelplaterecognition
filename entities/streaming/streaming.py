@@ -89,7 +89,7 @@ def save_event(frame, bbox):
 # CLASSE DE CÂMERA AJUSTADA
 # =========================
 class CameraSource:
-    def __init__(self, source, buffer_size=30, reconnect_delay=2, width=640, height=360):
+    def __init__(self, source, buffer_size=30, reconnect_delay=5, width=640, height=360):
         self.source = source
         self.buffer = deque(maxlen=buffer_size)
         self.lock = threading.Lock()
@@ -98,6 +98,7 @@ class CameraSource:
         self.reconnect_delay = reconnect_delay
         self.width = width
         self.height = height
+
         self.proc = None
         self.cap = None
         self.frame_interval = 0.033
@@ -106,118 +107,181 @@ class CameraSource:
         self.is_webcam = isinstance(source, int)
         self.is_rtsp = isinstance(source, str) and source.startswith("rtsp://")
 
-        # inicia a thread que vai ler os frames
         threading.Thread(target=self._reader, daemon=True).start()
 
+    # =========================
+    # LOG DO FFMPEG
+    # =========================
+    def _log_ffmpeg(self):
+        for line in self.proc.stderr:
+            print("[FFMPEG]", line.decode(errors="ignore").strip())
+
+    # =========================
+    # LEITURA SEGURA
+    # =========================
+    def read_exact(self, size):
+        data = b''
+        while len(data) < size:
+            packet = self.proc.stdout.read(size - len(data))
+            if not packet:
+                return None
+            data += packet
+        return data
+
+    # =========================
+    # CONEXÃO
+    # =========================
     def connect(self):
+        print("[CAMERA] Reiniciando conexão...")
+
         if self.proc:
             self.proc.kill()
             self.proc = None
+
         if self.cap:
             self.cap.release()
             self.cap = None
-            time.sleep(1.0)  # garante liberação do dispositivo
 
+        time.sleep(2)
+
+        # =========================
+        # RTSP (FFMPEG ESTÁVEL)
+        # =========================
+        if self.is_rtsp:
+            print(f"[CAMERA] Conectando RTSP: {self.source}")
+
+            binffmpeg = r"C:\Users\Vinicius\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+
+            self.proc = subprocess.Popen(
+                [
+                    binffmpeg,
+                    "-rtsp_transport", "udp",
+                    "-timeout", "5000000",
+                    "-i", self.source,
+                    "-an",
+                    "-vf", f"scale={self.width}:{self.height}:flags=fast_bilinear",
+                    "-pix_fmt", "bgr24",
+                    "-f", "rawvideo",
+                    "-"
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=10**7
+            )
+
+            threading.Thread(target=self._log_ffmpeg, daemon=True).start()
+
+            self.frame_interval = 0.033
+            return
+
+        # =========================
+        # WEBCAM / ARQUIVO
+        # =========================
         if self.is_local_file or self.is_webcam:
-            max_wait = 10  # segundos para esperar a câmera
-            start_time = time.time()
-            ret = False
-            first_frame = None
+            while True:
+                self.cap = cv2.VideoCapture(self.source)
 
-            while time.time() - start_time < max_wait:
-                try:
-                    if self.cap is None or not self.cap.isOpened():
-                        self.cap = cv2.VideoCapture(self.source)
-                        if not self.cap.isOpened():
-                            raise Exception("Device busy")
-
+                if self.cap.isOpened():
                     ret, frame = self.cap.read()
                     if ret:
-                        first_frame = frame
-                        break  # câmera pronta
+                        with self.lock:
+                            self.buffer.append(frame)
+                            self.last_frame_time = time.time()
 
-                except Exception as e:
-                    print(f"[CAMERA] Não foi possível abrir a câmera: {e}")
+                        fps = self.cap.get(cv2.CAP_PROP_FPS)
+                        self.frame_interval = 1 / fps if fps > 0 else 0.033
 
-                time.sleep(0.5)  # espera antes de tentar de novo
+                        print(f"[CAMERA] Conectado: {self.source}")
+                        return
 
-            if not ret:
-                print(f"[CAMERA] Webcam ou vídeo não retornou frames após {max_wait}s: {self.source}")
-                if self.cap:
-                    self.cap.release()
-                    self.cap = None
-                self.last_frame_time = 0
-                return
+                print("[CAMERA] Tentando reconectar webcam/video...")
+                time.sleep(2)
 
-            # Coloca o primeiro frame no buffer
-            with self.lock:
-                self.buffer.append(first_frame)
-                self.last_frame_time = time.time()
-
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.frame_interval = 1 / fps if fps > 0 else 0.033
-            print(f"[CAMERA] Conectado a {'arquivo' if self.is_local_file else 'webcam'}: {self.source}")
-
+    # =========================
+    # THREAD DE LEITURA
+    # =========================
     def _reader(self):
         self.connect()
+
         while self.running:
             try:
+                # =========================
+                # WEBCAM / ARQUIVO
+                # =========================
                 if self.is_local_file or self.is_webcam:
                     if not self.cap or not self.cap.isOpened():
-                        time.sleep(self.reconnect_delay)
                         self.connect()
                         continue
 
                     ret, frame = self.cap.read()
+
                     if not ret:
                         if self.is_local_file:
-                            # reinicia vídeo do início
                             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                             continue
                         else:
-                            # webcam travada, tenta reconectar
                             self.connect()
                             continue
 
-                else:  # RTSP ou ffmpeg proc
+                # =========================
+                # RTSP (RAWVIDEO ESTÁVEL)
+                # =========================
+                else:
                     if not self.proc:
-                        time.sleep(self.reconnect_delay)
                         self.connect()
                         continue
-                    raw_frame = self.proc.stdout.read(self.width * self.height * 3)
-                    if len(raw_frame) != self.width * self.height * 3:
+
+                    frame_size = self.width * self.height * 3
+                    raw = self.read_exact(frame_size)
+
+                    if raw is None:
+                        print("[RTSP] Falha ao ler frame, reconectando...")
                         self.connect()
-                        time.sleep(self.reconnect_delay)
+                        time.sleep(1)
                         continue
-                    frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((self.height, self.width, 3))
+
+                    frame = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        (self.height, self.width, 3)
+                    ).copy()
+
+                # =========================
+                # BUFFER
+                # =========================
+                with self.lock:
+                    self.buffer.append(frame)
+                    self.last_frame_time = time.time()
+
+                if self.is_local_file or self.is_webcam:
+                    time.sleep(self.frame_interval)
 
             except Exception as e:
                 print("[CAMERA] Erro:", e)
                 self.connect()
                 time.sleep(self.reconnect_delay)
-                continue
 
-            with self.lock:
-                self.buffer.append(frame)
-                self.last_frame_time = time.time()
-
-            if self.is_local_file or self.is_webcam:
-                time.sleep(self.frame_interval)
-
+    # =========================
+    # LEITURA EXTERNA
+    # =========================
     def read(self):
         with self.lock:
             if self.buffer:
                 return True, self.buffer.popleft()
             return False, None
 
-    def watchdog(self, timeout=5):
-        # só reinicia se for webcam ou RTSP
-        if (self.is_webcam or self.is_rtsp):
-            if (time.time() - self.last_frame_time > timeout) and ((self.cap and self.cap.isOpened()) or self.proc):
-                print("[WATCHDOG] Reiniciando câmera...")
+    # =========================
+    # WATCHDOG INTELIGENTE
+    # =========================
+    def watchdog(self, timeout=10):
+        if self.is_rtsp:
+            if self.proc and self.proc.poll() is not None:
+                print("[WATCHDOG] FFmpeg morreu, reiniciando...")
                 self.connect()
+                return
 
-
+        if self.is_webcam:
+            if time.time() - self.last_frame_time > timeout:
+                print("[WATCHDOG] Webcam travou, reiniciando...")
+                self.connect()
 # =========================
 # FUNÇÃO GET CAMERA (SINGLETON)
 # =========================
