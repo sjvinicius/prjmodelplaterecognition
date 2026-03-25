@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 from cryptography.fernet import Fernet
 import numpy as np
 import subprocess
+from paddleocr import PaddleOCR
+from collections import Counter
+from entities.security.whitelist import load_whitelist, plate_token
 
 load_dotenv()
 stream_bp = Blueprint("stream_bp", __name__)
@@ -36,10 +39,15 @@ MIN_VEHICLE_AREA = int(os.getenv("MIN_VEHICLE_AREA", 10000))
 IOU_MATCH = float(os.getenv("IOU_MATCH", 0.5))
 SHOW_BORDER_IDENTIFICATION = os.getenv("SHOW_BORDER_IDENTIFICATION", "true").lower() == "true"
 
+OCR_ENABLED = True
+OCR_MIN_CONFIDENCE = 0.6
+CONFIRMATION_THRESHOLD = 3
+OCR_FRAME_SKIP = 2
+
 # =========================
 # MODELOS
 # =========================
-VEHICLE_MODEL = YOLO("yolov8n.pt")
+VEHICLE_MODEL = YOLO("models/yolov8n.pt")
 PLATE_MODEL = YOLO("models/LP-detection.pt")
 
 # =========================
@@ -48,6 +56,44 @@ PLATE_MODEL = YOLO("models/LP-detection.pt")
 ACTIVE_PLATES = {}
 _camera_instance = None  # singleton da câmera
 
+ocr = PaddleOCR(
+    use_angle_cls=True,
+    lang='en',
+    show_log=False
+)
+
+def normalize_plate(text):
+    return text.replace("-", "").replace(" ", "").upper()
+
+
+def read_plate_ocr(crop):
+    result = ocr.ocr(crop, cls=True)
+
+    if not result or not result[0]:
+        return None
+
+    best_text = None
+    best_conf = 0
+
+    for line in result[0]:
+        text = line[1][0]
+        conf = line[1][1]
+
+        if conf > best_conf:
+            best_text = text
+            best_conf = conf
+
+    if best_text and best_conf > OCR_MIN_CONFIDENCE:
+        return normalize_plate(best_text)
+
+    return None
+
+
+def most_common(lst):
+    return Counter(lst).most_common(1)[0][0]
+
+def trigger_gate():
+    print("[GATE] ABRINDO PORTÃO 🚪")
 # =========================
 # FUNÇÃO IOU
 # =========================
@@ -64,7 +110,7 @@ def iou(a, b):
 # =========================
 # SALVA EVENTO
 # =========================
-def save_event(frame, bbox):
+def save_event(frame, bbox, pid):
     x1, y1, x2, y2 = bbox
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
@@ -75,6 +121,7 @@ def save_event(frame, bbox):
     encrypted = cipher.encrypt(base64.b64encode(buffer)).decode()
     with open(os.path.join(EVENTS_DIR, f"{event_id}.json"), "w") as f:
         f.write(f"""{{
+            "plate_id": "{pid}",
             "event_id": "{event_id}",
             "timestamp": {ts},
             "bbox": [{x1},{y1},{x2},{y2}],
@@ -289,7 +336,6 @@ def get_camera():
     global _camera_instance
     if _camera_instance is None:
         print(CAMERA_SOURCE_ENV)
-        print("teste")
         print(CAMERA_SOURCE_ENV)
         if CAMERA_SOURCE_ENV.isdigit():
             source = int(CAMERA_SOURCE_ENV)
@@ -362,7 +408,7 @@ def gen_frames(camera):
 
                 if pid:
                     ACTIVE_PLATES[pid]["last_seen"] = now
-                    if now - ACTIVE_PLATES[pid]["last_event"] < PLATE_COOLDOWN:
+                    if pid and ACTIVE_PLATES[pid]["authorized"]:
                         continue
                 else:
                     pid = str(uuid.uuid4())
@@ -370,12 +416,66 @@ def gen_frames(camera):
                         "bbox": (ax1, ay1, ax2, ay2),
                         "last_seen": now,
                         "last_event": 0,
-                        "status": "new"
+                        "status": "new",
+                        "reads": [],
+                        "authorized": False,
+                        "ocr_skip": 0
                     }
 
-                save_event(frame, (ax1, ay1, ax2, ay2))
-                ACTIVE_PLATES[pid]["last_event"] = now
-                ACTIVE_PLATES[pid]["status"] = "sent"
+                # =========================
+                # OCR PIPELINE
+                # =========================
+                crop_plate = frame[ay1:ay2, ax1:ax2]
+
+                if crop_plate.size == 0:
+                    continue
+
+                # Pré-processamento
+                gray = cv2.cvtColor(crop_plate, cv2.COLOR_BGR2GRAY)
+                processed = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
+
+                plate_text = None
+
+                if OCR_ENABLED:
+                    ACTIVE_PLATES[pid]["ocr_skip"] += 1
+
+                    if ACTIVE_PLATES[pid]["ocr_skip"] >= OCR_FRAME_SKIP:
+                        ACTIVE_PLATES[pid]["ocr_skip"] = 0
+                        plate_text = read_plate_ocr(processed)
+
+                # =========================
+                # PROCESSAMENTO OCR
+                # =========================
+                if plate_text:
+                    ACTIVE_PLATES[pid]["reads"].append(plate_text)
+
+                    if len(ACTIVE_PLATES[pid]["reads"]) > 10:
+                        ACTIVE_PLATES[pid]["reads"].pop(0)
+
+                    if len(ACTIVE_PLATES[pid]["reads"]) >= CONFIRMATION_THRESHOLD:
+                        final_plate = most_common(ACTIVE_PLATES[pid]["reads"])
+
+                        whitelist = load_whitelist()
+                        token = plate_token(final_plate)
+
+                        if token in whitelist and not ACTIVE_PLATES[pid]["authorized"]:
+                            print(f"[ACCESS] AUTORIZADO: {final_plate}")
+
+                            trigger_gate()
+
+                            # ✅ AGORA SIM salva evento
+                            save_event(frame, (ax1, ay1, ax2, ay2), pid)
+
+                            ACTIVE_PLATES[pid]["authorized"] = True
+                            ACTIVE_PLATES[pid]["last_event"] = now
+                            ACTIVE_PLATES[pid]["status"] = "sent"
+
+                # =========================
+                # DEBUG VISUAL
+                # =========================
+                if plate_text:
+                    cv2.putText(frame, plate_text, (ax1, ay1 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
                 if SHOW_BORDER_IDENTIFICATION:
                     cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)

@@ -4,11 +4,13 @@ import traceback
 from flask import Flask
 from entities.platerecognizer.infer import infer_bp
 from entities.streaming.streaming import stream_bp
+from entities.security.whitelist import whitelist_bp
 # , authenticate
 
 app = Flask(__name__)
 app.register_blueprint(infer_bp)
 app.register_blueprint(stream_bp)
+app.register_blueprint(whitelist_bp)
 
 # @app.before_first_request
 # def init_auth():
