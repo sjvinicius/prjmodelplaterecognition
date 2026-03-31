@@ -1,15 +1,13 @@
-import os
 import time
 import traceback
 from flask import Flask
-from entities.platerecognizer.infer import infer_bp
+# from entities.platerecognizer.infer import infer_bp
 from entities.streaming.streaming import stream_bp
 from entities.security.whitelist import whitelist_bp
 # , authenticate
-import json
 
 app = Flask(__name__)
-app.register_blueprint(infer_bp)
+# app.register_blueprint(infer_bp)
 app.register_blueprint(stream_bp)
 app.register_blueprint(whitelist_bp)
 

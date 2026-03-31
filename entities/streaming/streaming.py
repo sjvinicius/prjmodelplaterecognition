@@ -1,4 +1,9 @@
 import os
+
+os.environ["FLAGS_use_mkldnn"] = "false"
+os.environ["FLAGS_enable_pir_api"] = "0"
+os.environ["FLAGS_use_pir"] = "0"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
 import time
 import uuid
 import cv2
@@ -13,7 +18,7 @@ import numpy as np
 import subprocess
 from paddleocr import PaddleOCR
 from collections import Counter
-from entities.security.whitelist import load_whitelist_cached
+from entities.security.whitelist import load_whitelist_cached, plate_token
 
 load_dotenv()
 stream_bp = Blueprint("stream_bp", __name__)
@@ -40,7 +45,7 @@ IOU_MATCH = float(os.getenv("IOU_MATCH", 0.5))
 SHOW_BORDER_IDENTIFICATION = os.getenv("SHOW_BORDER_IDENTIFICATION", "true").lower() == "true"
 
 OCR_ENABLED = True
-OCR_MIN_CONFIDENCE = 0.6
+OCR_MIN_CONFIDENCE = 0.3
 CONFIRMATION_THRESHOLD = 3
 OCR_FRAME_SKIP = 2
 
@@ -77,7 +82,7 @@ def read_plate_ocr(crop):
     for line in result[0]:
         text = line[1][0]
         conf = line[1][1]
-
+        print(f"[OCR] {text} ({conf})")  # 🔥 DEBUG
         if conf > best_conf:
             best_text = text
             best_conf = conf
@@ -433,8 +438,10 @@ def gen_frames(camera):
 
                 # Pré-processamento
                 gray = cv2.cvtColor(crop_plate, cv2.COLOR_BGR2GRAY)
-                processed = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
-                processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+                
+                # processed = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
+                # processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+                processed = crop_plate
 
                 plate_text = None
 
@@ -445,6 +452,7 @@ def gen_frames(camera):
                         ACTIVE_PLATES[pid]["ocr_skip"] = 0
                         plate_text = read_plate_ocr(processed)
 
+                print(f"[PLACA] Placa detectada: {plate_text}")
                 # =========================
                 # PROCESSAMENTO OCR
                 # =========================
@@ -454,11 +462,14 @@ def gen_frames(camera):
                     if len(ACTIVE_PLATES[pid]["reads"]) > 10:
                         ACTIVE_PLATES[pid]["reads"].pop(0)
 
+                    print(f"[ACTIVE] Placa detectada: {ACTIVE_PLATES}")
                     if len(ACTIVE_PLATES[pid]["reads"]) >= CONFIRMATION_THRESHOLD:
                         final_plate = most_common(ACTIVE_PLATES[pid]["reads"])
-
                                                 
                         whitelist = load_whitelist_cached()
+
+                        whitelist = {"OJJ3984"};
+                        print(f"[PLACA2] Placa detectada: {final_plate}")
                         token = plate_token(final_plate)
 
                         if token in whitelist and not ACTIVE_PLATES[pid]["authorized"]:
