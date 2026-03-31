@@ -13,7 +13,7 @@ import numpy as np
 import subprocess
 from paddleocr import PaddleOCR
 from collections import Counter
-from entities.security.whitelist import load_whitelist, plate_token
+from entities.security.whitelist import load_whitelist_cached
 
 load_dotenv()
 stream_bp = Blueprint("stream_bp", __name__)
@@ -58,8 +58,7 @@ _camera_instance = None  # singleton da câmera
 
 ocr = PaddleOCR(
     use_angle_cls=True,
-    lang='en',
-    show_log=False
+    lang='en'
 )
 
 def normalize_plate(text):
@@ -67,7 +66,7 @@ def normalize_plate(text):
 
 
 def read_plate_ocr(crop):
-    result = ocr.ocr(crop, cls=True)
+    result = ocr.ocr(crop)
 
     if not result or not result[0]:
         return None
@@ -197,8 +196,8 @@ class CameraSource:
         if self.is_rtsp:
             print(f"[CAMERA] Conectando RTSP: {self.source}")
 
-            binffmpeg = r"C:\Users\Vinicius\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
-
+            # binffmpeg = r"C:\Users\Vinicius\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg.Essentials_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-essentials_build\bin\ffmpeg.exe"
+            binffmpeg = "ffmpeg"  # assume ffmpeg no PATH
             self.proc = subprocess.Popen(
                 [
                     binffmpeg,
@@ -387,6 +386,8 @@ def gen_frames(camera):
             if int(b.cls[0]) not in [2, 3]:
                 continue
             x1, y1, x2, y2 = map(int, b.xyxy[0])
+            # 🔵 VEÍCULO (azul)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
             if (x2 - x1) * (y2 - y1) < MIN_VEHICLE_AREA:
                 continue
             roi = frame[y1:y2, x1:x2]
@@ -433,6 +434,7 @@ def gen_frames(camera):
                 # Pré-processamento
                 gray = cv2.cvtColor(crop_plate, cv2.COLOR_BGR2GRAY)
                 processed = cv2.threshold(gray, 120, 255, cv2.THRESH_BINARY)[1]
+                processed = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
 
                 plate_text = None
 
@@ -455,7 +457,8 @@ def gen_frames(camera):
                     if len(ACTIVE_PLATES[pid]["reads"]) >= CONFIRMATION_THRESHOLD:
                         final_plate = most_common(ACTIVE_PLATES[pid]["reads"])
 
-                        whitelist = load_whitelist()
+                                                
+                        whitelist = load_whitelist_cached()
                         token = plate_token(final_plate)
 
                         if token in whitelist and not ACTIVE_PLATES[pid]["authorized"]:
@@ -478,7 +481,12 @@ def gen_frames(camera):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
                 if SHOW_BORDER_IDENTIFICATION:
-                    cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (0, 255, 0), 2)
+                    if ACTIVE_PLATES[pid]["authorized"]:
+                        color = (0, 255, 0)  # 🟢 autorizado
+                    else:
+                        color = (0, 0, 255)  # 🔴 não autorizado
+
+                    cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), color, 2)
 
         cv2.putText(frame, f"FPS: {fps}", (20, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)

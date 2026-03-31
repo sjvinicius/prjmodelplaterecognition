@@ -1,6 +1,52 @@
 import requests
+import os
+import json
+from flask import Blueprint, request, jsonify
+
+whitelist_bp = Blueprint("whitelist", __name__)
+
+WHITELIST_FILE = os.getenv("WHITELIST_FILE", "whitelist.json")
 
 EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL")
+
+_whitelist_cache = set()
+_last_load = 0
+
+def load_whitelist_cached(ttl=5):
+    global _whitelist_cache, _last_load
+
+    now = time.time()
+
+    if now - _last_load > ttl:
+        _whitelist_cache = load_whitelist()
+        _last_load = now
+
+    return _whitelist_cache
+
+def load_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        return set()
+
+    try:
+        with open(WHITELIST_FILE, "r") as f:
+            data = json.load(f)
+
+        # garante formato correto
+        if not isinstance(data, list):
+            return set()
+
+        return set(data)
+
+    except Exception as e:
+        print("[WHITELIST LOAD ERROR]", e)
+        return set()
+
+
+def plate_token(plate: str):
+    if not plate:
+        return None
+
+    return plate.replace("-", "").replace(" ", "").upper()
 
 def external_login():
     response = requests.post(

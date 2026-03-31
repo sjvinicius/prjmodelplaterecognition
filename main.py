@@ -6,6 +6,7 @@ from entities.platerecognizer.infer import infer_bp
 from entities.streaming.streaming import stream_bp
 from entities.security.whitelist import whitelist_bp
 # , authenticate
+import json
 
 app = Flask(__name__)
 app.register_blueprint(infer_bp)
