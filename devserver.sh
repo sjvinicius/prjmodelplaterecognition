@@ -11,6 +11,11 @@ pip install --upgrade pip
 pip install -r requirements.txt
 # Necessário instalar o FFMPEG para habilitar o funcionamento de conexão em câmeras RTSP.
 
+# winget install Gyan.FFmpeg
+
+# sudo apt update
+# sudo apt install ffmpeg -y
+
 # python3 -u -m flask --app main run --debug
 # py -u -m flask --app main run --debug
 
