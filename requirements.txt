@@ -123,3 +123,4 @@ ultralytics==8.0.230
 urllib3==2.6.3
 visualdl==2.5.3
 Werkzeug==3.1.8
+APScheduler==3.10.4

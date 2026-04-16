@@ -1,10 +1,15 @@
 import time
 import traceback
 from flask import Flask
+import threading
+import requests
+import os
 # from entities.platerecognizer.infer import infer_bp
 from entities.streaming.streaming import stream_bp
-from entities.security.whitelist import whitelist_bp
+from entities.security.whitelist import whitelist_bp,sync_whitelist
+
 # , authenticate
+print("[INIT] MAIN");
 
 app = Flask(__name__)
 # app.register_blueprint(infer_bp)
@@ -96,13 +101,27 @@ def index():
     </html>
     '''
 
+# def sync_whitelist_loop():
+#     print("[THREAD] INICIOU")
+#     while True:
+#         try:
+#             print("[SYNC] rodando sync automático...")
+#             sync_whitelist()
+
+#         except Exception as e:
+#             print("[SYNC ERROR]", e)
+
+#         time.sleep(5)
 
 if __name__ == "__main__":
-    while True:
-        try:
-            # app.run(debug=True, use_reloader=False, host="0.0.0.0", port=3000)
-             app.run(debug=False, use_reloader=False, host="0.0.0.0", port=3000)
-        except Exception:
-            traceback.print_exc()
-            print("Aplicação travou! Reiniciando em 5 segundos...")
-            time.sleep(5)
+    
+    # while True:
+    try:
+        # app.run(debug=True, use_reloader=False, host="0.0.0.0", port=3000)
+        # threading.Thread(target=sync_whitelist_loop, daemon=True).start()
+
+        app.run(debug=False, use_reloader=False, host="0.0.0.0", port=3000, threaded=True)
+    except Exception:
+        traceback.print_exc()
+        print("Aplicação travou! Reiniciando em 5 segundos...")
+        time.sleep(5)

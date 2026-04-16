@@ -18,7 +18,9 @@ import numpy as np
 import subprocess
 from paddleocr import PaddleOCR
 from collections import Counter
-from entities.security.whitelist import load_whitelist_cached, plate_token
+from entities.security.whitelist import plate_token, sync_whitelist, load_whitelist_decrypted
+import re
+from apscheduler.schedulers.background import BackgroundScheduler
 
 load_dotenv()
 stream_bp = Blueprint("stream_bp", __name__)
@@ -32,7 +34,7 @@ cipher = Fernet(SECRET_KEY)
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 DEBUG_CAMERA = os.getenv("DEBUG_CAMERA", "true").lower() == "true"
-CAMERA_SOURCE_ENV = os.getenv("CAMERA_SOURCE", "resources/video480p.mp4")
+CAMERA_SOURCE_ENV = os.getenv("CAMERA_SOURCE", "resources/fiat.mp4")
 
 EVENTS_DIR = os.path.join(BASE_DIR, "events")
 os.makedirs(EVENTS_DIR, exist_ok=True)
@@ -46,7 +48,7 @@ SHOW_BORDER_IDENTIFICATION = os.getenv("SHOW_BORDER_IDENTIFICATION", "true").low
 
 OCR_ENABLED = True
 OCR_MIN_CONFIDENCE = 0.3
-CONFIRMATION_THRESHOLD = 3
+CONFIRMATION_THRESHOLD = 2
 OCR_FRAME_SKIP = 2
 
 # =========================
@@ -67,12 +69,20 @@ ocr = PaddleOCR(
 )
 
 def normalize_plate(text):
-    return text.replace("-", "").replace(" ", "").upper()
+    return re.sub(r'[^A-Za-z0-9]', '', text).upper()
 
+def center(box):
+    return ((box[0]+box[2])//2, (box[1]+box[3])//2)
+
+def distance(a, b):
+    return ((a[0]-b[0])**2 + (a[1]-b[1])**2) ** 0.5
 
 def read_plate_ocr(crop):
+    print(" ")
+    print("[OCR] READ OCR ")
     result = ocr.ocr(crop)
 
+    print("[OCR] RESULT ", result)
     if not result or not result[0]:
         return None
 
@@ -86,7 +96,8 @@ def read_plate_ocr(crop):
         if conf > best_conf:
             best_text = text
             best_conf = conf
-
+    print("[CONF] OCR ACCURACY ", best_conf)
+    print("[CONF] OCR TEXT ", best_text)
     if best_text and best_conf > OCR_MIN_CONFIDENCE:
         return normalize_plate(best_text)
 
@@ -114,7 +125,7 @@ def iou(a, b):
 # =========================
 # SALVA EVENTO
 # =========================
-def save_event(frame, bbox, pid):
+def save_event(frame, bbox, pid, teste = "N"):
     x1, y1, x2, y2 = bbox
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
@@ -123,13 +134,17 @@ def save_event(frame, bbox, pid):
     ts = int(time.time())
     _, buffer = cv2.imencode(".jpg", crop)
     encrypted = cipher.encrypt(base64.b64encode(buffer)).decode()
-    with open(os.path.join(EVENTS_DIR, f"{event_id}.json"), "w") as f:
+    pathevents = EVENTS_DIR
+    if teste == "S":
+        pathevents = EVENTS_DIR + "/false"
+    with open(os.path.join(pathevents, f"{event_id}.json"), "w") as f:
         f.write(f"""{{
             "plate_id": "{pid}",
             "event_id": "{event_id}",
             "timestamp": {ts},
             "bbox": [{x1},{y1},{x2},{y2}],
-            "image_encrypted": "{encrypted}"
+            "image_encrypted": "{encrypted}",
+            "image_unencrypted": "{base64.b64encode(buffer.tobytes()).decode()}"
         }}""")
     print(f"[EVENT] {event_id}")
 
@@ -339,8 +354,7 @@ class CameraSource:
 def get_camera():
     global _camera_instance
     if _camera_instance is None:
-        print(CAMERA_SOURCE_ENV)
-        print(CAMERA_SOURCE_ENV)
+        print("[SOURCE] ",CAMERA_SOURCE_ENV)
         if CAMERA_SOURCE_ENV.isdigit():
             source = int(CAMERA_SOURCE_ENV)
         else:
@@ -407,13 +421,28 @@ def gen_frames(camera):
                     continue
 
                 pid = None
+                best_pid = None
+                best_score = 0
                 for k, v in ACTIVE_PLATES.items():
-                    if iou(v["bbox"], (ax1, ay1, ax2, ay2)) > IOU_MATCH:
-                        pid = k
-                        break
+                    iou_score = iou(v["bbox"], (ax1, ay1, ax2, ay2))
+                    dist = distance(center(v["bbox"]), center((ax1, ay1, ax2, ay2)))
+
+                    # combinação simples
+                    score = iou_score - (dist * 0.002)
+
+                    if score > best_score:
+                        best_score = score
+                        best_pid = k
+
+                if best_score > 0.1:
+                    pid = best_pid
+                else:
+                    pid = None
+                print(f"[PID] {pid}")
 
                 if pid:
                     ACTIVE_PLATES[pid]["last_seen"] = now
+                    ACTIVE_PLATES[pid]["bbox"] = (ax1, ay1, ax2, ay2)
                     if pid and ACTIVE_PLATES[pid]["authorized"]:
                         continue
                 else:
@@ -446,13 +475,19 @@ def gen_frames(camera):
                 plate_text = None
 
                 if OCR_ENABLED:
-                    ACTIVE_PLATES[pid]["ocr_skip"] += 1
+                    skip = ACTIVE_PLATES[pid].get("ocr_skip", 0)
 
-                    if ACTIVE_PLATES[pid]["ocr_skip"] >= OCR_FRAME_SKIP:
-                        ACTIVE_PLATES[pid]["ocr_skip"] = 0
+                    if skip == 0 or skip >= OCR_FRAME_SKIP:
                         plate_text = read_plate_ocr(processed)
+                        skip = 1  # começa contagem depois de rodar
+                    else:
+                        print("[SKIPPED] BY OCR_SKIP")
+                        skip += 1
 
-                print(f"[PLACA] Placa detectada: {plate_text}")
+                    ACTIVE_PLATES[pid]["ocr_skip"] = skip
+
+                print(f"[PLACA] Placa detectada pela OCR: {plate_text}")
+                save_event(frame, (ax1, ay1, ax2, ay2), pid, "S")
                 # =========================
                 # PROCESSAMENTO OCR
                 # =========================
@@ -462,14 +497,13 @@ def gen_frames(camera):
                     if len(ACTIVE_PLATES[pid]["reads"]) > 10:
                         ACTIVE_PLATES[pid]["reads"].pop(0)
 
-                    print(f"[ACTIVE] Placa detectada: {ACTIVE_PLATES}")
+                    # print(f"[ACTIVE] Placas no PID: {ACTIVE_PLATES}")
+                    print(f"[READS] {len(ACTIVE_PLATES[pid]['reads'])}/{CONFIRMATION_THRESHOLD}")
                     if len(ACTIVE_PLATES[pid]["reads"]) >= CONFIRMATION_THRESHOLD:
                         final_plate = most_common(ACTIVE_PLATES[pid]["reads"])
-                                                
-                        whitelist = load_whitelist_cached()
+                        whitelist = load_whitelist_decrypted()
+                        # whitelist = {"0JJ3984", "OJJ3984", "OV03P0J", "OV03POJ", "OVO3POJ", "0VO3POJ"}
 
-                        whitelist = {"OJJ3984"};
-                        print(f"[PLACA2] Placa detectada: {final_plate}")
                         token = plate_token(final_plate)
 
                         if token in whitelist and not ACTIVE_PLATES[pid]["authorized"]:
@@ -483,6 +517,9 @@ def gen_frames(camera):
                             ACTIVE_PLATES[pid]["authorized"] = True
                             ACTIVE_PLATES[pid]["last_event"] = now
                             ACTIVE_PLATES[pid]["status"] = "sent"
+                        else:
+                            print(f"[NOTACCESS] NÃO AUTORIZADO: {final_plate}")
+                            
 
                 # =========================
                 # DEBUG VISUAL
@@ -505,13 +542,25 @@ def gen_frames(camera):
         ret, buf = cv2.imencode(".jpg", frame)
         yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
 
+def start_scheduler():
+    scheduler = BackgroundScheduler(daemon=True)
+
+    scheduler.add_job(
+        func=sync_whitelist,
+        trigger="interval",
+        seconds=10
+    )
+
+    scheduler.start()
+    print("[SCHEDULER] iniciado")
+            
 # =========================
 # ROTAS FLASK
 # =========================
 @stream_bp.route("/video_feed")
 def video_feed():
     camera = get_camera()
-
+    start_scheduler()
     return Response(gen_frames(camera), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 @stream_bp.route("/health")
